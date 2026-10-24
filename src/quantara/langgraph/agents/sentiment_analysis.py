@@ -803,8 +803,12 @@ class SentimentAnalysisAgent:
             self.logger.info(f"Fetching news via Apify for queries: {search_queries}")
             
             all_articles = []
+            seen_urls = set()
+            queries = search_queries[:3]  # Limit to 3 queries to avoid rate limits
+            per_query = max(1, self.max_news_articles // len(queries))
+            loop = asyncio.get_running_loop()
             
-            for query in search_queries[:3]:  # Limit to 3 queries to avoid rate limits
+            for query in queries:
                 try:
                     # Google News search via johnvc/GoogleNewsAPI (one results page per query)
                     run_input = {
@@ -815,18 +819,23 @@ class SentimentAnalysisAgent:
                     
                     # Run the actor and wait for results. The actor stops searching
                     # 30 seconds before its run timeout, so it needs more than 30.
-                    run = self.apify_client.actor("johnvc/GoogleNewsAPI").call(
+                    # The client is synchronous, so run it off the event loop.
+                    run = await loop.run_in_executor(None, lambda: self.apify_client.actor("johnvc/GoogleNewsAPI").call(
                         run_input=run_input,
                         timeout_secs=120
-                    )
+                    ))
                     
                     # Fetch results from dataset: one item per page, articles in news_results
-                    pages = list(self.apify_client.dataset(run["defaultDatasetId"]).iterate_items())
+                    pages = await loop.run_in_executor(None, lambda: list(self.apify_client.dataset(run["defaultDatasetId"]).iterate_items()))
                     items = [a for page in pages for a in (page.get("news_results") or [])]
-                    items = items[:self.max_news_articles // len(search_queries)]
+                    items = items[:per_query]
                     
                     # Transform Apify results to our format
                     for item in items:
+                        url = item.get("link") or ""
+                        if url and url in seen_urls:
+                            continue  # the same story came back for another query
+                        seen_urls.add(url)
                         # published_at is "2026-10-10 03:34:00 UTC"; keep timestamps
                         # naive local time, like datetime.now() used elsewhere here
                         try:
@@ -835,10 +844,10 @@ class SentimentAnalysisAgent:
                         except (KeyError, AttributeError, ValueError):
                             timestamp = datetime.now().isoformat()
                         article = {
-                            "title": item.get("title", ""),
-                            "content": item.get("snippet", ""),
-                            "source": item.get("source", "Unknown"),
-                            "url": item.get("link", ""),
+                            "title": item.get("title") or "",
+                            "content": item.get("snippet") or "",
+                            "source": item.get("source") or "Unknown",
+                            "url": url,
                             "timestamp": timestamp,
                             "sentiment": "neutral",  # Will be analyzed separately
                             "relevance_score": 0.8,
